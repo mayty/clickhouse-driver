@@ -1,6 +1,6 @@
 from datetime import date, datetime, time
 from enum import Enum
-from functools import wraps
+from functools import wraps, partial
 from uuid import UUID
 
 from pytz import timezone
@@ -26,7 +26,12 @@ def escape_datetime(item, context):
     if item.tzinfo is not None:
         item = item.astimezone(server_tz)
 
-    return "'%s'" % item.strftime('%Y-%m-%d %H:%M:%S')
+    if item.microsecond:
+        format = '%Y-%m-%d %H:%M:%S.%f'
+    else:
+        format = '%Y-%m-%d %H:%M:%S'
+
+    return f"'{item.strftime(format)}'"
 
 
 def maybe_enquote_for_server(f):
@@ -34,19 +39,33 @@ def maybe_enquote_for_server(f):
     def wrapper(*args, **kwargs):
         rv = f(*args, **kwargs)
 
-        if kwargs.get('for_server'):
-            is_str = isinstance(rv, str)
+        if not kwargs.get('for_server'):
+            return rv
 
-            if not is_str or (is_str and not rv.startswith("'")):
-                rv = "'%s'" % rv
+        is_str = isinstance(rv, str)
 
-        return rv
+        nested = kwargs.get('nested')
+        item = kwargs['item'] if 'item' in kwargs else args[0]
+        if is_str and not isinstance(item, (list, tuple)):
+            if rv[0] == "'":
+                if nested:
+                    return f"\\'{rv[1:-1]}\\'"
+                return rv
+            if nested:
+                return f"\\'{rv}\\'"
+            return f"'{rv}'"
+
+        if nested:
+            return str(rv)
+        return f"'{rv!s}'"
 
     return wrapper
 
 
 @maybe_enquote_for_server
-def escape_param(item, context, for_server=False):
+def escape_param(
+    item, context, for_server=False, nested=False
+):
     if item is None:
         return 'NULL'
 
@@ -54,32 +73,63 @@ def escape_param(item, context, for_server=False):
         return escape_datetime(item, context)
 
     elif isinstance(item, date):
-        return "'%s'" % item.strftime('%Y-%m-%d')
+        return f"'{item.strftime('%Y-%m-%d')}'"
 
     elif isinstance(item, time):
-        return "'%s'" % item.strftime('%H:%M:%S')
+        return f"'{item.strftime('%H:%M:%S')}'"
 
     elif isinstance(item, str):
         # We need double escaping for server-side parameters.
         if for_server:
             item = ''.join(escape_chars_map.get(c, c) for c in item)
-        return "'%s'" % ''.join(escape_chars_map.get(c, c) for c in item)
+        return f"'{''.join(escape_chars_map.get(c, c) for c in item)}'"
 
     elif isinstance(item, list):
-        return "[%s]" % ', '.join(
-            str(escape_param(x, context, for_server=for_server)) for x in item
+        serialized_array = ', '.join(
+            str(
+                escape_param(
+                    x,
+                    context,
+                    for_server=for_server,
+                    nested=True,
+                )
+            ) for x in item
         )
+        return f'[{serialized_array}]'
 
     elif isinstance(item, tuple):
-        return "(%s)" % ', '.join(
-            str(escape_param(x, context, for_server=for_server)) for x in item
+        serialized_tuple = ', '.join(
+            str(
+                escape_param(
+                    x,
+                    context,
+                    for_server=for_server,
+                    nested=True,
+                )
+            ) for x in item
         )
+
+        return f'({serialized_tuple})'
+
+    elif isinstance(item, dict):
+        serializer = partial(
+            escape_param,
+            context=context,
+            for_server=for_server,
+            nested=True,
+        )
+
+        serialized_dict = ', '.join(
+            f'{serializer(key)!s}: {serializer(value)!s}'
+            for key, value in item.items()
+        )
+        return f'{{{serialized_dict}}}'
 
     elif isinstance(item, Enum):
         return escape_param(item.value, context, for_server=for_server)
 
     elif isinstance(item, UUID):
-        return "'%s'" % str(item)
+        return f"'{item!s}'"
 
     else:
         return item
